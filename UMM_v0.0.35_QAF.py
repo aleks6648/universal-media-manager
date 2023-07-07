@@ -1,8 +1,10 @@
+import sys
 import os
+import time
 from collections import defaultdict
-from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtWidgets import QFileDialog, QTreeWidgetItem
-from PyQt5.QtCore import QThread, QTimer
+from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtWidgets import QFileDialog, QTreeWidgetItem, QVBoxLayout, QPushButton, QProgressBar, QApplication
+from PyQt5.QtCore import QThread, QTimer, pyqtSignal
 
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
@@ -27,6 +29,10 @@ class Ui_MainWindow(object):
         self.scanButton.setEnabled(False)
         self.scanButton.setObjectName("scanButton")
         self.inputLayout.addWidget(self.scanButton)
+        self.stopButton = QtWidgets.QPushButton(self.centralwidget)
+        self.stopButton.setVisible(False)
+        self.stopButton.setObjectName("stopButton")
+        self.inputLayout.addWidget(self.stopButton)
         self.verticalLayout.addLayout(self.inputLayout)
         self.treeWidget = QtWidgets.QTreeWidget(self.centralwidget)
         self.treeWidget.setObjectName("treeWidget")
@@ -58,6 +64,7 @@ class Ui_MainWindow(object):
         self.directoryLabel.setText(_translate("MainWindow", "Директория:"))
         self.browseButton.setText(_translate("MainWindow", "Обзор"))
         self.scanButton.setText(_translate("MainWindow", "Сканировать"))
+        self.stopButton.setText(_translate("MainWindow", "Стоп"))
 
 class ScanThread(QThread):
     update_progress = QtCore.pyqtSignal(int)
@@ -65,6 +72,7 @@ class ScanThread(QThread):
 
     def __init__(self, directory, parent=None):
         self.directory = directory
+        self.stop_requested = False
         super(ScanThread, self).__init__(parent)
 
     def run(self):
@@ -72,6 +80,8 @@ class ScanThread(QThread):
         total_files = sum([len(files) for r, d, files in os.walk(self.directory)])
         current_file = 0
         for root, dirs, files in os.walk(self.directory):
+            if self.stop_requested:
+                break
             for file in files:
                 file_path = os.path.join(root, file)
                 file_size = os.path.getsize(file_path)
@@ -79,8 +89,14 @@ class ScanThread(QThread):
                 current_file += 1
                 progress = (current_file / total_files) * 100
                 self.update_progress.emit(progress)
+            if self.stop_requested:
+                break
 
-        self.scan_complete.emit(file_sizes)
+        if not self.stop_requested:
+            self.scan_complete.emit(file_sizes)
+
+    def stop(self):
+        self.stop_requested = True
 
 class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     def __init__(self, *args, **kwargs):
@@ -89,21 +105,27 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         self.progress_value = 0
         self.scan_thread = None
-        # Создаем таймер
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_progress_ui)
-        self.timer.start(100)  # обновляем прогресс бар каждые 100 мс
+        self.timer.start(100)
 
         self.browseButton.clicked.connect(self.browse)
         self.scanButton.clicked.connect(self.scan)
+        self.stopButton.clicked.connect(self.stop_scan)
         self.directoryLineEdit.textChanged.connect(self.enable_scan_button)
-        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+V"), self.directoryLineEdit, self.paste_from_clipboard)
+
+        self.pbar = QProgressBar(self.centralwidget)
+        self.pbar.setValue(0)
+        self.statusLayout.addWidget(self.pbar)
+        self.btn = QPushButton(self.centralwidget)
+        self.btn.setText("Start Progress")
+        self.statusLayout.addWidget(self.btn)
+        self.btn.clicked.connect(self.start_progress)
 
     def format_file_size(self, size):
-        """Returns the file size in human readable format."""
-        if size < 1024 * 1024:  # size less than 1MB
+        if size < 1024 * 1024:
             return f"{size / 1024:.2f} KB"
-        else:  # size 1MB or more
+        else:
             return f"{size / 1024 / 1024:.2f} MB"
 
     def browse(self):
@@ -131,23 +153,29 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.progressBar.setMaximum(100)
             self.progressBar.setValue(0)
             self.progressBar.setVisible(True)
+            self.scanButton.setVisible(False)
+            self.stopButton.setVisible(True)
             self.scan_thread = ScanThread(directory)
             self.scan_thread.update_progress.connect(self.store_progress_value)
             self.scan_thread.scan_complete.connect(self.on_scan_complete)
             self.scan_thread.start()
 
+    def stop_scan(self):
+        if self.scan_thread:
+            self.scan_thread.stop()
+            self.stopButton.setVisible(False)
+            self.scanButton.setVisible(True)
+
     def on_update_progress(self, progress, file_path, file_name):
-        print(f'On update progress: {progress}')
-        self.progress_value = int(progress)  # Сохраняем значение прогресса, вместо обновления интерфейса здесь
+        self.progress_value = int(progress)
         self.statusbar1.setText(f"Сканирование: {file_name}")
         self.statusbar2.setText(f"Путь: {file_path}")
-        QtCore.QCoreApplication.processEvents()  # Обрабатываем события в главном потоке
+        QtCore.QCoreApplication.processEvents()
 
     def store_progress_value(self, progress):
         self.progress_value = progress
 
     def update_progress_ui(self):
-        # Обновляем интерфейс здесь
         self.progressBar.setValue(self.progress_value)
 
     def on_scan_complete(self, file_sizes):
@@ -167,7 +195,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         duplicates_percentage = (duplicates / total_files) * 100
 
         self.statusbar1.setText(f"Всего файлов: {total_files}, Количество дубликатов: {duplicates}")
-        self.statusbar2.setText(f"Размер дубликатов: {self.format_file_size(duplicates_size)}, Процент дубликатов: {duplicates_percentage:.2f}%")
+        self.statusbar2.setText(
+            f"Размер дубликатов: {self.format_file_size(duplicates_size)}, Процент дубликатов: {duplicates_percentage:.2f}%")
 
         for size, files in file_sizes.items():
             if len(files) > 1:
@@ -184,11 +213,40 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     dup.setText(3, duplicate[0])
                 self.treeWidget.expandItem(original)
 
-        self.treeWidget.collapseAll()  # Свернем все элементы в дереве
+        self.treeWidget.collapseAll()
+
+        self.stopButton.setVisible(False)
+        self.scanButton.setVisible(True)
+
+    def start_progress(self):
+        self.thread = Thread()
+        self.thread._signal.connect(self.signal_accept)
+        self.thread.start()
+        self.btn.setEnabled(False)
+
+    def signal_accept(self, msg):
+
+        self.pbar.setValue(int(msg))
+        if self.pbar.value() == 100:
+            self.pbar.setValue(0)
+            self.btn.setEnabled(True)
+
+
+class Thread(QThread):
+    _signal = pyqtSignal(int)
+
+    def __init__(self):
+        super(Thread, self).__init__()
+
+    def __del__(self):
+        self.wait()
+
+    def run(self):
+        for i in range(101):
+            time.sleep(0.1)
+            self._signal.emit(i)
 
 if __name__ == "__main__":
-    import sys
-
     app = QtWidgets.QApplication(sys.argv)
     MainWindow = MainWindow()
     MainWindow.show()
